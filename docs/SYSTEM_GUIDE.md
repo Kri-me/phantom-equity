@@ -103,4 +103,4 @@ These are starting rules, not calibrated fraud probabilities. ACRIS document_amt
 - **No map data:** run pluto_geocode.py after properties have been loaded.
 - **Document opens blank:** search the displayed document ID through the ACRIS search link in the dashboard.
 
-For the detailed internals, including the table model, algorithm flow, scoring formulas, data caveats, and a guided study plan, see the comprehensive technical guide shared separately with the project owner.
+For the current audit results and evidence boundaries, see [Findings and limitations](FINDINGS_AND_LIMITATIONS.md). For detailed internals, including the table model, algorithm flow, scoring formulas, and a guided study plan, see the comprehensive technical guide shared separately with the project owner.
