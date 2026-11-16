@@ -70,6 +70,8 @@ After the database contains properties, run:
 
 This downloads and caches NYC PLUTO pages and writes property coordinates. Exact-lot positions are preferred; when a condo unit BBL is not listed by PLUTO, the map may use an approximate block-level position.
 
+For a hosted dashboard, apply migration 004 and load the generated map, refinancing, and exclusion-audit files into PostgreSQL. See the [Neon and Streamlit deployment runbook](NEON_STREAMLIT_DEPLOYMENT.md) for the guided migration and deployment steps.
+
 Start the dashboard from scripts/:
 
     streamlit run ../views/investigation_queue.py

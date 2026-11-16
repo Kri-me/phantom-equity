@@ -2,7 +2,7 @@
 
 Phantom Equity is a local analyst workbench for exploring unusual patterns in New York City property, deed, and mortgage records. It produces investigation leads and review tools; its signals and scores are not findings of fraud.
 
-Start with the public walkthrough at docs/SYSTEM_GUIDE.md to install and run the local system. See [Findings and limitations](docs/FINDINGS_AND_LIMITATIONS.md) for current audit results and evidence boundaries.
+Start with the public walkthrough at docs/SYSTEM_GUIDE.md to install and run the local system. See [Findings and limitations](docs/FINDINGS_AND_LIMITATIONS.md) for current audit results and evidence boundaries. For hosting, follow the [Neon and Streamlit runbook](docs/NEON_STREAMLIT_DEPLOYMENT.md).
 
 ## Repository contents
 
@@ -11,6 +11,7 @@ Start with the public walkthrough at docs/SYSTEM_GUIDE.md to install and run the
 - views/investigation_queue.py — Streamlit analyst dashboard.
 - docs/SYSTEM_GUIDE.md — public setup and usage walkthrough.
 - docs/FINDINGS_AND_LIMITATIONS.md — current audit findings and interpretation limits.
+- docs/NEON_STREAMLIT_DEPLOYMENT.md — Neon restore and Streamlit Community Cloud runbook.
 
 Downloaded ACRIS and PLUTO data, generated CSVs, pipeline logs, credentials, and the local virtual environment are deliberately excluded from Git. Create a local .env from .env.example and supply your own database settings and optional Socrata token.
 

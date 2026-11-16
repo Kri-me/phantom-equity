@@ -36,9 +36,28 @@ from dotenv import load_dotenv
 from pyvis.network import Network
 from sqlalchemy import create_engine
 from sqlalchemy.engine import Engine
+from streamlit.errors import StreamlitSecretNotFoundError
 
 env_path = Path(__file__).resolve().parent.parent / ".env"
 load_dotenv(dotenv_path=env_path, override=True)
+
+
+def app_setting(name, default=None):
+    """Read local environment configuration or a Streamlit Cloud secret."""
+    value = os.environ.get(name)
+    if value is not None and value.strip():
+        return value
+    try:
+        return st.secrets.get(name, default)
+    except StreamlitSecretNotFoundError:
+        return default
+
+
+def public_read_only():
+    return str(app_setting("PUBLIC_READ_ONLY", "false")).strip().lower() in {
+        "1", "true", "yes", "on"
+    }
+
 
 REVIEW_STATUSES = ["under_review", "strong_candidate", "false_positive"]
 CLOSED_REASONS = [
@@ -111,18 +130,18 @@ def doc_link_column(label):
 
 @st.cache_resource
 def get_connection():
-    database_url = os.environ.get("DATABASE_URL")
+    database_url = app_setting("DATABASE_URL")
     if database_url and "profitability_diagnostics" not in database_url:
         database_url = database_url.replace("postgresql+psycopg://", "postgresql://")
         database_url = database_url.replace("postgresql+psycopg2://", "postgresql://")
         conn = psycopg2.connect(database_url)
     else:
         conn = psycopg2.connect(
-            host=os.environ.get("PGHOST", "localhost"),
-            port=os.environ.get("PGPORT", "5432"),
-            dbname=os.environ.get("PGDATABASE", "phantom_equity"),
-            user=os.environ.get("PGUSER", "postgres"),
-            password=os.environ.get("PGPASSWORD", ""),
+            host=app_setting("PGHOST", "localhost"),
+            port=app_setting("PGPORT", "5432"),
+            dbname=app_setting("PGDATABASE", "phantom_equity"),
+            user=app_setting("PGUSER", "postgres"),
+            password=app_setting("PGPASSWORD", ""),
         )
     conn.autocommit = True
     return conn
@@ -131,17 +150,17 @@ def get_connection():
 @st.cache_resource
 def get_engine() -> Engine:
     """SQLAlchemy engine for pandas.read_sql."""
-    database_url = os.environ.get("DATABASE_URL")
+    database_url = app_setting("DATABASE_URL")
 
     if database_url and "profitability_diagnostics" not in database_url:
         url = database_url.replace("postgresql+psycopg://", "postgresql+psycopg2://")
         return create_engine(url, pool_pre_ping=True)
 
-    user = os.environ.get("PGUSER", "postgres")
-    password = os.environ.get("PGPASSWORD", "")
-    host = os.environ.get("PGHOST", "localhost")
-    port = os.environ.get("PGPORT", "5432")
-    dbname = os.environ.get("PGDATABASE", "phantom_equity")
+    user = app_setting("PGUSER", "postgres")
+    password = app_setting("PGPASSWORD", "")
+    host = app_setting("PGHOST", "localhost")
+    port = app_setting("PGPORT", "5432")
+    dbname = app_setting("PGDATABASE", "phantom_equity")
 
     url = f"postgresql+psycopg2://{user}:{password}@{host}:{port}/{dbname}"
     return create_engine(url, pool_pre_ping=True)
@@ -151,7 +170,63 @@ def run_query(sql, params=None):
     return pd.read_sql(sql, get_engine(), params=params)
 
 
+DASHBOARD_ASSET_QUERIES = {
+    "exclusions": (
+        "signal_party_overlap_exclusions",
+        "SELECT bbl, deed_doc_id, deed_date, deed_amt, mtge_doc_id, mtge_date, mtge_amt, "
+        "days_between, mortgage_to_price_ratio, deed_buyer_names, mtge_doc_names "
+        "FROM signal_party_overlap_exclusions ORDER BY deed_date DESC NULLS LAST",
+    ),
+    "serial_refinancing": (
+        "signal_serial_refinancing",
+        "SELECT bbl, mtge1_date, mtge1_amt, mtge1_doc_id, mtge2_date, mtge2_amt, "
+        "mtge2_doc_id, days_between, amt_increase, borrower_changed "
+        "FROM signal_serial_refinancing ORDER BY mtge2_date DESC NULLS LAST",
+    ),
+    "property_geo": (
+        "property_geo",
+        "SELECT bbl, lat, lon, precision FROM property_geo",
+    ),
+}
+
+
+@st.cache_data(ttl=300)
+def dashboard_asset_available(asset_name):
+    if asset_name not in DASHBOARD_ASSET_QUERIES:
+        raise ValueError(f"Unknown dashboard asset: {asset_name}")
+    table_name, _ = DASHBOARD_ASSET_QUERIES[asset_name]
+    return bool(run_query(
+        f"SELECT to_regclass('public.{table_name}') IS NOT NULL AS available"
+    ).iloc[0]["available"])
+
+
+@st.cache_data(ttl=300)
+def fetch_dashboard_asset(asset_name):
+    if not dashboard_asset_available(asset_name):
+        return None
+    _, query = DASHBOARD_ASSET_QUERIES[asset_name]
+    return run_query(query)
+
+
+@st.cache_data(ttl=300)
+def dashboard_asset_stamp(asset_name):
+    available = run_query(
+        "SELECT to_regclass('public.dashboard_asset_meta') IS NOT NULL AS available"
+    ).iloc[0]["available"]
+    if not available:
+        return None
+    frame = run_query(
+        "SELECT loaded_at FROM dashboard_asset_meta WHERE asset_name = %s",
+        (asset_name,),
+    )
+    if frame.empty:
+        return None
+    return pd.to_datetime(frame.iloc[0]["loaded_at"], utc=True).strftime("%Y-%m-%d %H:%M UTC")
+
+
 def run_write(sql, params):
+    if public_read_only():
+        raise PermissionError("Database writes are disabled in this public portfolio deployment.")
     conn = get_connection()
     with conn.cursor() as cur:
         cur.execute(sql, params)
@@ -499,6 +574,9 @@ def build_case_network_html(case_id, props_df, edges_df, wider_entities=None):
 
 @st.cache_resource
 def ensure_reviews_table():
+    # Public deployments use a pre-created table and a read-only DB role.
+    if public_read_only():
+        return True
     run_write(REVIEWS_DDL, None)
     return True
 
@@ -522,6 +600,9 @@ def add_review_columns(df, signal_type, a_col, b_col):
 
 def render_review_form(signal_type, bbl, doc_a, doc_b, key,
     statuses=None, reasons=None, reason_status="false_positive"):
+    if public_read_only():
+        st.caption("Review submission is disabled in this public portfolio deployment.")
+        return
     statuses = statuses or REVIEW_STATUSES
     reasons = reasons or CLOSED_REASONS
     rv = fetch_reviews()
@@ -1101,10 +1182,14 @@ def render_signal_explorer():
         key=f"explorer_{stype}",
     )
 
+    review_hint = (
+        "Select a row to inspect its review state."
+        if public_read_only() else "Select a row to record a review."
+    )
     st.caption(
         "case_id is not stable across case_builder.py rebuilds. "
         "Note findings by BBL. A signal without a case_id/case_score "
-        "did not land in any case. Select a row to record a review."
+        f"did not land in any case. {review_hint}"
     )
 
     selected = event.selection.rows
@@ -1138,25 +1223,37 @@ def _best_similarity(buyers, doc_names):
     return max(_name_sim(b, d) for b in bs for d in ds)
 
 
-@st.cache_data
-def load_exclusions(path_str, mtime):
-    df = pd.read_csv(path_str, dtype={"bbl": str, "deed_doc_id": str, "mtge_doc_id": str})
+def prepare_exclusions(df):
+    df = df.copy()
     df["name_similarity"] = [
         _best_similarity(b, d) for b, d in zip(df["deed_buyer_names"], df["mtge_doc_names"])
     ]
     return df
 
 
+@st.cache_data
+def load_exclusions(path_str, mtime):
+    return prepare_exclusions(pd.read_csv(
+        path_str, dtype={"bbl": str, "deed_doc_id": str, "mtge_doc_id": str}
+    ))
+
+
 def render_exclusion_audit():
     page_header(VIEW_META["Exclusion audit"][0], "Exclusion audit", VIEW_META["Exclusion audit"][1])
-    if not EXCLUSION_CSV.exists():
-        st.warning(
-            f"{EXCLUSION_CSV.name} not found. Apply the exclusion-log patch to signals.py and "
-            "re-run it (python signals.py from the scripts folder) to produce it."
-        )
-        return
-    mtime = EXCLUSION_CSV.stat().st_mtime
-    df = load_exclusions(str(EXCLUSION_CSV), mtime)
+    df = fetch_dashboard_asset("exclusions")
+    if df is None:
+        if not EXCLUSION_CSV.exists():
+            st.warning(
+                f"{EXCLUSION_CSV.name} not found. Run signals.py and load dashboard assets "
+                "before deploying this view."
+            )
+            return
+        mtime = EXCLUSION_CSV.stat().st_mtime
+        df = load_exclusions(str(EXCLUSION_CSV), mtime)
+        source_stamp = _file_stamp(EXCLUSION_CSV)
+    else:
+        df = prepare_exclusions(df)
+        source_stamp = dashboard_asset_stamp("signal_party_overlap_exclusions") or "database snapshot"
     if df.empty:
         st.info("The exclusion log is empty -- no party-overlap exclusions were recorded.")
         return
@@ -1164,7 +1261,7 @@ def render_exclusion_audit():
     df = df.assign(review=df["review"].fillna("unreviewed"), reason=df["reason"].fillna(""))
 
     st.caption(
-        f"Log from the last signals.py run ({pd.Timestamp(mtime, unit='s'):%Y-%m-%d %H:%M} UTC). "
+        f"Log snapshot: {source_stamp}. "
         "Each row is one (deed, excluded financing document) pair. Rows below the "
         f"{OVER_MORTGAGE_RATIO}x ratio could not have been flagged either way, so they don't "
         "matter for false exclusions. Exclusion requires an exact-name mismatch, so a "
@@ -1207,10 +1304,16 @@ def render_exclusion_audit():
         column_config={"deed_doc": doc_link_column("Deed doc"), "mtge_doc": doc_link_column("Mortgage doc")},
         on_select="rerun", selection_mode="single-row", key="exclusion_audit",
     )
-    st.caption(
-        "Select a row to record a verdict. In ACRIS, compare the deed's grantee with the "
-        "mortgage's mortgagor: same party under a different spelling = wrongly_excluded."
-    )
+    if public_read_only():
+        st.caption(
+            "Review submission is disabled in this public portfolio deployment. "
+            "In ACRIS, compare the deed's grantee with the mortgage's mortgagor."
+        )
+    else:
+        st.caption(
+            "Select a row to record a verdict. In ACRIS, compare the deed's grantee with the "
+            "mortgage's mortgagor: same party under a different spelling = wrongly_excluded."
+        )
     selected = event.selection.rows
     if selected and selected[0] < len(out):
         r = out.iloc[selected[0]]
@@ -1247,19 +1350,25 @@ def load_serial_refi(path_str, mtime):
 
 def render_serial_refi():
     page_header(VIEW_META["Serial refinancing"][0], "Serial refinancing", VIEW_META["Serial refinancing"][1])
-    if not SERIAL_REFI_CSV.exists():
-        st.warning(f"{SERIAL_REFI_CSV.name} not found. Run signals.py (from the scripts folder) first.")
-        return
-    mtime = SERIAL_REFI_CSV.stat().st_mtime
-    df = load_serial_refi(str(SERIAL_REFI_CSV), mtime)
+    df = fetch_dashboard_asset("serial_refinancing")
+    if df is None:
+        if not SERIAL_REFI_CSV.exists():
+            st.warning(f"{SERIAL_REFI_CSV.name} not found. Run signals.py and load dashboard assets first.")
+            return
+        mtime = SERIAL_REFI_CSV.stat().st_mtime
+        df = load_serial_refi(str(SERIAL_REFI_CSV), mtime)
+        source_stamp = _file_stamp(SERIAL_REFI_CSV)
+    else:
+        df = prep_serial_refi(df)
+        source_stamp = dashboard_asset_stamp("signal_serial_refinancing") or "database snapshot"
     if df.empty:
-        st.info("No serial-refinancing candidates in the last signals.py run.")
+        st.info("No serial-refinancing candidates in the latest loaded signal data.")
         return
     df = add_review_columns(df, "serial_refinancing", "mtge1_doc_id", "mtge2_doc_id")
     df = df.assign(review=df["review"].fillna("unreviewed"), reason=df["reason"].fillna(""))
 
     st.caption(
-        f"From the last signals.py run ({pd.Timestamp(mtime, unit='s'):%Y-%m-%d %H:%M} UTC). "
+        f"Loaded signal snapshot: {source_stamp}. "
         "Ordinary refinancing has the same shape as this signal, so a row here is a candidate "
         "to open the documents for, not evidence of anything on its own."
     )
@@ -1398,11 +1507,17 @@ def render_serial_refi():
         column_config={"mtge1_doc": doc_link_column("Mortgage 1"), "mtge2_doc": doc_link_column("Mortgage 2")},
         on_select="rerun", selection_mode="single-row", key="serial_refi",
     )
-    st.caption(
-        "Select a row to record a review. When opening the documents, compare the mortgage cover "
-        "pages: taxable vs total amount and any exemption code distinguish a consolidation from "
-        "fresh borrowing, and a changed borrower between the two is flagged, not excluded."
-    )
+    if public_read_only():
+        st.caption(
+            "Review submission is disabled in this public portfolio deployment. When opening "
+            "the documents, compare the mortgage cover pages; borrower changes are clues, not findings."
+        )
+    else:
+        st.caption(
+            "Select a row to record a review. When opening the documents, compare the mortgage cover "
+            "pages: taxable vs total amount and any exemption code distinguish a consolidation from "
+            "fresh borrowing, and a changed borrower between the two is flagged, not excluded."
+        )
     selected = event.selection.rows
     if selected and selected[0] < len(out):
         r = out.iloc[selected[0]]
@@ -1910,11 +2025,13 @@ def _initial_view(frames):
 
 def render_map_view():
     page_header(VIEW_META["Map view"][0], "Map view", VIEW_META["Map view"][1])
-    if not PROPERTY_GEO_CSV.exists():
-        st.warning(f"{PROPERTY_GEO_CSV.name} not found. Run pluto_geocode.py (from the scripts folder) first.")
-        return
-    mtime = PROPERTY_GEO_CSV.stat().st_mtime
-    geo = load_property_geo(str(PROPERTY_GEO_CSV), mtime)
+    geo = fetch_dashboard_asset("property_geo")
+    if geo is None:
+        if not PROPERTY_GEO_CSV.exists():
+            st.warning(f"{PROPERTY_GEO_CSV.name} not found. Run pluto_geocode.py and load dashboard assets first.")
+            return
+        mtime = PROPERTY_GEO_CSV.stat().st_mtime
+        geo = load_property_geo(str(PROPERTY_GEO_CSV), mtime)
 
     layer = st.sidebar.radio("Layer", ["Over-mortgaging", "Rapid flips", "Serial refinancing", "Cases"])
     precision_mode = st.sidebar.radio(
@@ -1944,11 +2061,15 @@ def render_map_view():
         df = df[df["pct_price_increase"] >= min_pct]
         mag_col, mag_label = "pct_price_increase", "sale-price increase (%)"
     else:
-        mt_serial = SERIAL_REFI_CSV.stat().st_mtime if SERIAL_REFI_CSV.exists() else None
-        if mt_serial is None:
-            st.warning(f"{SERIAL_REFI_CSV.name} not found. Run signals.py first.")
-            return
-        df = load_serial_refi(str(SERIAL_REFI_CSV), mt_serial)
+        df = fetch_dashboard_asset("serial_refinancing")
+        if df is None:
+            if not SERIAL_REFI_CSV.exists():
+                st.warning(f"{SERIAL_REFI_CSV.name} not found. Run signals.py and load dashboard assets first.")
+                return
+            mt_serial = SERIAL_REFI_CSV.stat().st_mtime
+            df = load_serial_refi(str(SERIAL_REFI_CSV), mt_serial)
+        else:
+            df = prep_serial_refi(df)
         df = add_review_columns(df, "serial_refinancing", "mtge1_doc_id", "mtge2_doc_id")
         if st.sidebar.checkbox("Hide same-document rows (known artifact)", value=True):
             df = df[~df["same_doc"]]
@@ -2601,12 +2722,20 @@ def home_stats():
         "refi": None, "geo_exact": None, "geo_block": None, "reviews": {}, "audit_reviewed": 0,
     }
     try:
-        stats["refi"] = len(pd.read_csv(SERIAL_REFI_CSV, usecols=["bbl"]))
+        if dashboard_asset_available("serial_refinancing"):
+            stats["refi"] = scalar("SELECT COUNT(*) FROM signal_serial_refinancing")
+        elif SERIAL_REFI_CSV.exists():
+            stats["refi"] = len(pd.read_csv(SERIAL_REFI_CSV, usecols=["bbl"]))
     except Exception:
         pass
     try:
-        geo = pd.read_csv(PROPERTY_GEO_CSV, usecols=["precision"])["precision"].value_counts()
-        stats["geo_exact"], stats["geo_block"] = int(geo.get("lot", 0)), int(geo.get("block", 0))
+        if dashboard_asset_available("property_geo"):
+            geo = run_query("SELECT precision, COUNT(*) AS n FROM property_geo GROUP BY precision")
+            counts = dict(zip(geo["precision"], geo["n"].astype(int)))
+            stats["geo_exact"], stats["geo_block"] = counts.get("lot", 0), counts.get("block", 0)
+        elif PROPERTY_GEO_CSV.exists():
+            geo = pd.read_csv(PROPERTY_GEO_CSV, usecols=["precision"])["precision"].value_counts()
+            stats["geo_exact"], stats["geo_block"] = int(geo.get("lot", 0)), int(geo.get("block", 0))
     except Exception:
         pass
     try:
@@ -2630,7 +2759,7 @@ def render_home():
     stats = home_stats()
     hour = datetime.now().hour
     part = "morning" if hour < 12 else "afternoon" if hour < 18 else "evening"
-    name = os.environ.get("ANALYST_NAME", "").strip()
+    name = str(app_setting("ANALYST_NAME", "")).strip()
     greet = f"Good {part}, {html.escape(name)}" if name else f"Good {part}"
 
     st.markdown(
@@ -2735,9 +2864,11 @@ def render_home():
     key_counts = dict(stats["reviews"])
     key_counts["unreviewed"] = max(0, n_cand - reviewed)
     legend("Review states (used on every screen)", [(None, review_legend_items(key_counts))])
+    signal_stamp = dashboard_asset_stamp("signal_serial_refinancing") or _file_stamp(SERIAL_REFI_CSV)
+    geo_stamp = dashboard_asset_stamp("property_geo") or _file_stamp(PROPERTY_GEO_CSV)
     st.caption(
-        f"Signals last run: {_file_stamp(SERIAL_REFI_CSV)}  \u00b7  "
-        f"Map positions: {_file_stamp(PROPERTY_GEO_CSV)}  \u00b7  "
+        f"Signal data: {signal_stamp}  \u00b7  "
+        f"Map positions: {geo_stamp}  \u00b7  "
         f"Exclusion audit verdicts saved: {stats['audit_reviewed']:,}"
     )
 
@@ -2752,6 +2883,8 @@ def main():
         layout="wide", initial_sidebar_state="expanded",
     )
     inject_css()
+    if public_read_only():
+        st.caption("Public portfolio demo · read-only · records and signals are unverified investigation leads.")
     ensure_reviews_table()
     st.sidebar.markdown(
         f'<div class="pe-brand"><div class="pe-brand-title">\U0001F3DB\ufe0f {BRAND_NAME}</div>'
