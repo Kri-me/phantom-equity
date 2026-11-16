@@ -1,6 +1,7 @@
 numpy
 pandas
 psycopg2-binary
+psycopg[binary]
 pydeck
 pyvis
 python-dotenv
