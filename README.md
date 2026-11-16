@@ -2,7 +2,7 @@
 
 Phantom Equity is a local analyst workbench for exploring unusual patterns in New York City property, deed, and mortgage records. It produces investigation leads and review tools; its signals and scores are not findings of fraud.
 
-Start with the public walkthrough at docs/SYSTEM_GUIDE.md to install and run the local system. See [Findings and limitations](docs/FINDINGS_AND_LIMITATIONS.md) for current audit results and evidence boundaries. A separate comprehensive technical guide is maintained for the project owner.
+Start with the public walkthrough at docs/SYSTEM_GUIDE.md to install and run the local system. See [Findings and limitations](docs/FINDINGS_AND_LIMITATIONS.md) for current audit results and evidence boundaries.
 
 ## Repository contents
 
