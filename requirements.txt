@@ -1,0 +1,11 @@
+numpy
+pandas
+psycopg2-binary
+pydeck
+pyvis
+python-dotenv
+rapidfuzz
+requests
+scikit-learn
+SQLAlchemy
+streamlit

@@ -1,0 +1,40 @@
+# Local credentials and environment
+.env
+.env.*
+!.env.example
+acris token.txt
+.streamlit/secrets.toml
+
+# Downloaded source data and generated datasets
+/data/raw/
+/data/processed/
+/outputs/
+
+# Local run logs and one-off patch artifact
+/scripts/pipeline_run_*.txt
+/scripts/signals_party_overlap_log.patch
+/scripts/_diag.py
+/scripts/udit_refined_cohort_diagnostics.py
+/acris_output.txt
+
+# Python environments and generated files
+.venv/
+venv/
+env/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Local editor / operating-system artifacts
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Database exports / backups
+*.dump
+*.backup
+*.bak
