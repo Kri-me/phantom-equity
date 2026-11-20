@@ -74,7 +74,17 @@ SELLER_SIDE_ROLES = {"GRANTOR/SELLER", "GRANTOR", "TRANSFEROR", "PARTY 1/GRANTOR
 BORROWER_ROLE = "MORTGAGOR/BORROWER"
 
 
-DEED_TYPES = frozenset(dt for dt, v in DOC_CONTROL_CODES.items() if v[0] == "DEEDS AND OTHER CONVEYANCES")
+# Ordinary conveyance codes only. The official class "DEEDS AND OTHER CONVEYANCES" also holds timeshare
+# deeds (DEED, TS), correction deeds (CORRD, DEED COR, CONDEED...), contracts (CNTR, MCON, ACON), leases,
+# easements, development rights, declarations and court/government records -- none of which is an
+# arm's-length sale. Confirmed in real data: 2,190 of 3,949 nominal chains (55%) started from DEED, TS,
+# almost all on seven timeshare-building BBLs that merged into one case scoring 17,315.
+# This set matches the "ordinary conveyance" group in audit_acris_schema.py's DEED_CLASS.
+ORDINARY_CONVEYANCE_TYPES = frozenset({"DEED", "DEEDO", "DEEDP", "DEED, RC", "DEED, LE", "IDED", "REIT"})
+DEED_TYPES = frozenset(
+    dt for dt, v in DOC_CONTROL_CODES.items()
+    if v[0] == "DEEDS AND OTHER CONVEYANCES" and dt in ORDINARY_CONVEYANCE_TYPES
+)
 
 # Restricted to plain, unqualified new-money mortgage recordings only -- NOT every doc_type
 # DOC_CONTROL_CODES categorizes as "MORTGAGES & INSTRUMENTS". Confirmed in real data that the
@@ -94,6 +104,25 @@ GENUINE_MTGE_TYPES = frozenset({"MTGE"})
 REFI_WINDOW_DAYS = 365  # consecutive genuine mortgages within this many days, with no
                          # intervening deed, are treated as serial refinancing on the same
                          # property -- a starting guess, not validated against this data.
+
+
+# Timeshare buildings are identified by their documents, not only by property_type. In the Nov 20
+# data every one of the recurring-pattern BBLs (1-1010-1905, 1-1283-1002/1003, 1-1006-1302..1305) and
+# two more (1-1009-37, 1-1027-17xx) had hundreds to thousands of "DEED, TS" documents, yet mortgages and
+# ordinary-typed rows on the same BBLs still reached serial refinancing and the case queue because their
+# property_type was not "TS". Any BBL with at least TIMESHARE_BBL_MIN_DOCS timeshare deeds is excluded
+# outright from every signal that builds on load_and_join().
+TIMESHARE_DEED_TYPE = "DEED, TS"
+TIMESHARE_BBL_MIN_DOCS = 1
+
+
+def timeshare_bbls(merged):
+    """BBLs with at least TIMESHARE_BBL_MIN_DOCS distinct DEED, TS documents, with their document counts.
+    Must be computed BEFORE the property_type == TS rows are dropped, or the DEED, TS rows that identify
+    the building would already be gone."""
+    ts = merged[merged["doc_type"] == TIMESHARE_DEED_TYPE]
+    counts = ts.groupby("bbl")["document_id"].nunique()
+    return counts[counts >= TIMESHARE_BBL_MIN_DOCS]
 
 
 def load_and_join(raw_dir="../data/raw"):
@@ -123,9 +152,22 @@ def load_and_join(raw_dir="../data/raw"):
     # by street address overlap (7 Avenue, West 57th Street -- the same Hilton Club/Manhattan Club
     # buildings). Bulk interval sales at these addresses would otherwise flood the flip and
     # over-mortgaging signals the same way they flooded raw entity-frequency counts earlier.
+    ts_bbl_counts = timeshare_bbls(merged)
     n_ts = (merged["property_type"] == "TS").sum()
     merged = merged[merged["property_type"] != "TS"]
     print(f"Excluded {n_ts} timeshare-interval (property_type=TS) rows before signal detection")
+
+    # BBL-level timeshare exclusion (v13): see the comment above TIMESHARE_DEED_TYPE.
+    on_ts_bbl = merged["bbl"].isin(ts_bbl_counts.index)
+    n_ts_bbl_rows = int(on_ts_bbl.sum())
+    merged = merged[~on_ts_bbl]
+    top = ", ".join(f"{b} ({n})" for b, n in ts_bbl_counts.sort_values(ascending=False).head(5).items())
+    n_small = int((ts_bbl_counts < 5).sum())
+    print(f"Excluded {n_ts_bbl_rows} further row(s) on {len(ts_bbl_counts)} timeshare BBL(s) "
+          f"(any '{TIMESHARE_DEED_TYPE}' document recorded). Largest: {top or 'none'}")
+    if n_small:
+        print(f"  ({n_small} of those BBL(s) have fewer than 5 timeshare deeds -- check they really are "
+              f"timeshare buildings; raise TIMESHARE_BBL_MIN_DOCS to exclude fewer)")
 
     return merged
 
@@ -493,7 +535,7 @@ def detect_over_mortgaging(joined, buyer_names, seller_names, all_names, exclusi
     return result_df, block_pattern
 
 
-SCRIPT_VERSION = "v11-serial-refi-dedup-and-blanket-guard"
+SCRIPT_VERSION = "v13-timeshare-bbl-exclusion"
 
 
 def detect_serial_refinancing(joined, borrower_names):
@@ -525,6 +567,13 @@ def detect_serial_refinancing(joined, borrower_names):
     INPUT GUARDS (v11): duplicate (bbl, document_id) rows are dropped so a document is never
     paired with itself, and mortgages whose exact amount recurs across several properties
     (one project loan recorded per unit) are excluded via flag_bulk_multi_lot.
+
+    SESSION GUARD (v12): two consecutive mortgages whose document_ids share a recording-session
+    prefix (same_recording_session) are one closing recorded as several instruments -- spreader,
+    consolidation or gap mortgages, split notes -- not repeated borrowing. In the Nov 20 run 19 of
+    the 20 printed pairs were of this kind. Such pairs are skipped and counted, never silently lost.
+    The guard is deliberately NOT applied to detect_over_mortgaging, where a deed and its purchase
+    mortgage are legitimately recorded together.
     """
     mtges = joined[joined["doc_type"].isin(GENUINE_MTGE_TYPES)].dropna(
         subset=["recorded_datetime", "document_amt"]
@@ -550,6 +599,7 @@ def detect_serial_refinancing(joined, borrower_names):
     deed_dates_by_bbl = deeds.groupby("bbl")["recorded_datetime"].apply(list).to_dict()
 
     results = []
+    n_same_session = 0
     for bbl, mtge_group in mtges.groupby("bbl"):
         if len(mtge_group) < 2:
             continue
@@ -566,6 +616,10 @@ def detect_serial_refinancing(joined, borrower_names):
             # refinancing by an unchanged owner.
             if any(a["recorded_datetime"] < dd < b["recorded_datetime"] for dd in deed_dates):
                 continue
+            # SESSION GUARD: same closing's paperwork, not repeated borrowing (see docstring).
+            if same_recording_session(a["document_id"], b["document_id"]):
+                n_same_session += 1
+                continue
             borrower_a = borrower_names.get(a["document_id"], set())
             borrower_b = borrower_names.get(b["document_id"], set())
             borrower_changed = bool(borrower_a) and bool(borrower_b) and not (borrower_a & borrower_b)
@@ -577,6 +631,8 @@ def detect_serial_refinancing(joined, borrower_names):
                 "amt_increase": round(b["document_amt"] - a["document_amt"], 2),
                 "borrower_changed": borrower_changed,
             })
+    print(f"  ({n_same_session} consecutive-mortgage pair(s) skipped as same-recording-session "
+          f"instruments -- one closing recorded as several documents, not repeated borrowing)")
     result_df = pd.DataFrame(results)
     n_borrower_changed = sum(r["borrower_changed"] for r in results)
     print(f"  ({n_borrower_changed} of {len(results)} serial-refinancing candidates show a "
