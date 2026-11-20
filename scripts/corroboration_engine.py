@@ -44,6 +44,10 @@ WEIGHTS = {
     "temporal_180_days": 20,
     "temporal_365_days": 10,
     "mismatch_penalty": -5,
+    # Added after reviewing real output (case 771 scored 17,315 on 2,193 signals; case 979 scored 185
+    # on one signal). Both are starting guesses -- tune after inspecting the new queue.
+    "signal_volume_cap": 20,        # volume points stop growing after this many extra signals
+    "family_hint_penalty": -10,     # once per case if any nominal chain shares a grantor/grantee name token
 }
 
 
@@ -156,46 +160,35 @@ def fetch_case_signals(cursor, case_id):
 
 def fetch_case_relationships(cursor, case_id):
     """
-    Retrieve resolved entities associated with the case and identify
-    which entities participate in connecting relationships.
+    Split the case's resolved entities into connecting and evidence-only.
+
+    An entity is CONNECTING only if it holds an ownership-type (is_connecting) edge on at least TWO of the
+    case's own properties, i.e. it actually links properties together. Edges on properties outside the case
+    are ignored. Everything else on the case is evidence-only.
+
+    (The earlier version counted any is_connecting edge anywhere in the database, which made nearly every
+    entity "connecting" and let one-signal cases collect +15 per party.)
     """
 
     cursor.execute(
         """
-        SELECT DISTINCT entity_id
-        FROM case_entities
-        WHERE case_id = %s;
-        """,
-        (case_id,),
-    )
-
-    all_entity_ids = {
-        row[0]
-        for row in cursor.fetchall()
-        if row[0] is not None
-    }
-
-    if not all_entity_ids:
-        return set(), set()
-
-    cursor.execute(
-        """
-        SELECT DISTINCT ce.entity_id
+        SELECT
+            ce.entity_id,
+            COUNT(DISTINCT er.bbl) FILTER (WHERE er.is_connecting) AS n_case_bbls
         FROM case_entities ce
-        JOIN entity_relationships er
+        LEFT JOIN entity_relationships er
           ON er.entity_id = ce.entity_id
+         AND er.bbl IN (SELECT bbl FROM case_properties WHERE case_id = %s)
         WHERE ce.case_id = %s
-          AND er.is_connecting = TRUE;
+          AND ce.entity_id IS NOT NULL
+        GROUP BY ce.entity_id;
         """,
-        (case_id,),
+        (case_id, case_id),
     )
 
-    connecting_entity_ids = {
-        row[0]
-        for row in cursor.fetchall()
-        if row[0] is not None
-    }
-
+    rows = cursor.fetchall()
+    all_entity_ids = {row[0] for row in rows}
+    connecting_entity_ids = {row[0] for row in rows if (row[1] or 0) >= 2}
     evidence_only_ids = all_entity_ids - connecting_entity_ids
 
     return connecting_entity_ids, evidence_only_ids
@@ -217,6 +210,10 @@ def detect_round_trip(cursor, case_id):
     Party 1 / Party 2 are excluded from the direction sets because
     ACRIS did not decode their direction, so they cannot support a
     reliable round-trip test.
+
+    Only edges on the case's OWN properties are considered, so a round trip
+    needs the entity to be outgoing-only on one case property and
+    incoming-only on another. A single-property case can never earn it.
     """
 
     OUTGOING_ROLES = {
@@ -253,9 +250,10 @@ def detect_round_trip(cursor, case_id):
           ON ce.entity_id = er.entity_id
         WHERE ce.case_id = %s
           AND er.entity_id IS NOT NULL
-          AND er.bbl IS NOT NULL;
+          AND er.bbl IS NOT NULL
+          AND er.bbl IN (SELECT bbl FROM case_properties WHERE case_id = %s);
         """,
-        (case_id,),
+        (case_id, case_id),
     )
 
     entity_roles = defaultdict(lambda: defaultdict(set))
@@ -307,6 +305,33 @@ def fetch_case_date_span(cursor, case_id):
         return None
 
     return (last_date - first_date).days
+
+
+# ============================================================
+# FAMILY HINT
+# ============================================================
+
+def fetch_family_hint_count(cursor, case_id):
+    """
+    Count the case's nominal chains whose grantor and grantee share a name token.
+    transfer_signals.py documents this as a family hint that is usually benign
+    (estate planning, restructuring), so it lowers the priority slightly.
+    """
+
+    cursor.execute(
+        """
+        SELECT COUNT(*)
+        FROM case_signals cs
+        JOIN signal_nominal_chains snc
+          ON cs.signal_type = 'nominal_chain'
+         AND cs.signal_id = snc.signal_id
+        WHERE cs.case_id = %s
+          AND LOWER(COALESCE(snc.shared_name_token, '')) IN ('true', 't', '1', 'yes', 'y');
+        """,
+        (case_id,),
+    )
+
+    return cursor.fetchone()[0]
 
 
 # ============================================================
@@ -369,6 +394,7 @@ def score_case(cursor, case_id):
 
     round_trip = detect_round_trip(cursor, case_id)
     date_span_days = fetch_case_date_span(cursor, case_id)
+    family_hint_count = fetch_family_hint_count(cursor, case_id)
 
     signal_types = {
         signal["signal_type"]
@@ -396,7 +422,9 @@ def score_case(cursor, case_id):
     # signal beyond the first.
     # --------------------------------------------------------
 
-    volume_points = max(0, len(signals) - 1) * (
+    # Capped: one large case must not dwarf the whole queue.
+    extra_signals = max(0, len(signals) - 1)
+    volume_points = min(extra_signals, WEIGHTS["signal_volume_cap"]) * (
         WEIGHTS["signal_volume"]
     )
 
@@ -449,6 +477,12 @@ def score_case(cursor, case_id):
     # Final score
     # --------------------------------------------------------
 
+    family_points = (
+        WEIGHTS["family_hint_penalty"]
+        if family_hint_count
+        else 0
+    )
+
     score_components = {
         "signal_diversity": diversity_points,
         "signal_volume": volume_points,
@@ -457,6 +491,7 @@ def score_case(cursor, case_id):
         "round_trip": round_trip_points,
         "temporal_coherence": temporal_points,
         "mismatch_penalty": mismatch_points,
+        "family_hint_adjustment": family_points,
     }
 
     score = sum(score_components.values())
@@ -481,6 +516,8 @@ def score_case(cursor, case_id):
         f"Cross-property round-trip: {round_trip}\n"
         f"Event span (days): {date_span_days}\n"
         f"Mismatch indicators: {mismatch_count}\n"
+        f"Nominal chains with shared name token: {family_hint_count}\n"
+        f"Signal volume capped: {extra_signals > WEIGHTS['signal_volume_cap']}\n"
         "\nScore components:\n"
         + "\n".join(
             f"- {name}: {value:+.2f}"
