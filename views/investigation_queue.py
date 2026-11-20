@@ -233,12 +233,358 @@ def run_write(sql, params):
     conn.commit()
 
 
+# ============================================================
+# IN-APP EXPLANATIONS: what the flags, categories and scores mean
+# ============================================================
+
+NOMINAL_CASE_ROW_LIMIT = 500
+NOMINAL_CHAIN_REASONS = [
+    "family_or_estate_transfer", "ordinary_purchase", "unrelated_document",
+    "self_transfer", "duplicate_recording", "other",
+]
+
+# Fallback only. The app reads the live weights from corroboration_engine.WEIGHTS when it can import it.
+DEFAULT_SCORE_WEIGHTS = {
+    "signal_diversity": 30, "signal_volume": 5, "signal_volume_cap": 20,
+    "connecting_entity": 15, "evidence_only_entity": 3, "round_trip": 30,
+    "temporal_180_days": 20, "temporal_365_days": 10,
+    "mismatch_penalty": -5, "family_hint_penalty": -10,
+}
+
+
+@st.cache_resource
+def score_weights():
+    """Weights shown in the app. Read from corroboration_engine.py when it can be imported, so the
+    explanation cannot drift from the scoring; otherwise fall back to DEFAULT_SCORE_WEIGHTS."""
+    weights = dict(DEFAULT_SCORE_WEIGHTS)
+    try:
+        import corroboration_engine
+        weights.update({
+            k: v for k, v in corroboration_engine.WEIGHTS.items()
+            if isinstance(v, (int, float))
+        })
+    except Exception:
+        pass
+    return weights
+
+
+@st.cache_data(ttl=300)
+def table_exists(table_name):
+    try:
+        return bool(run_query(
+            "SELECT to_regclass(%(t)s) IS NOT NULL AS ok", {"t": f"public.{table_name}"}
+        ).iloc[0]["ok"])
+    except Exception:
+        return False
+
+
+def score_component_info():
+    w = score_weights()
+    return {
+        "signal_diversity": (
+            "Signal diversity",
+            f"{w['signal_diversity']:+g} for each distinct signal type beyond the first "
+            "(rapid flip, over-mortgaging, nominal chain).",
+        ),
+        "signal_volume": (
+            "Signal volume",
+            f"{w['signal_volume']:+g} for each signal beyond the first, counted up to "
+            f"{w['signal_volume_cap']:g} extra signals so one huge case cannot dwarf the queue.",
+        ),
+        "connecting_entities": (
+            "Connecting entities",
+            f"{w['connecting_entity']:+g} for each entity that holds an ownership role "
+            "(buyer, seller, grantor, grantee) on at least two of the case's own properties.",
+        ),
+        "evidence_only_entities": (
+            "Evidence-only entities",
+            f"{w['evidence_only_entity']:+g} for each other entity on the case's documents. "
+            "It links nothing by itself.",
+        ),
+        "round_trip": (
+            "Cross-property round trip",
+            f"{w['round_trip']:+g} once, if an entity only sells on one case property and "
+            "only buys on another.",
+        ),
+        "temporal_coherence": (
+            "Temporal coherence",
+            f"{w['temporal_180_days']:+g} if the case's recorded events fall within 180 days, "
+            f"{w['temporal_365_days']:+g} within 365 days.",
+        ),
+        "mismatch_penalty": (
+            "Unit/type mismatch",
+            f"{w['mismatch_penalty']:+g} for each signal flagged 'verify'.",
+        ),
+        "family_hint_adjustment": (
+            "Family hint",
+            f"{w['family_hint_penalty']:+g} once if a nominal chain's grantor and grantee share "
+            "a name token, which usually means family or estate planning.",
+        ),
+    }
+
+
+def parse_engine_note(note_text):
+    """Split corroboration_engine's audit note into (component, points) pairs and header facts."""
+    import re
+    components, facts, in_components = [], [], False
+    for raw in str(note_text).splitlines():
+        line = raw.strip()
+        if line.lower().startswith("score components"):
+            in_components = True
+            continue
+        m = re.match(r"^-\s*([a-z_]+):\s*([+-]?\d+(?:\.\d+)?)\s*$", line)
+        if in_components and m:
+            components.append((m.group(1), float(m.group(2))))
+            continue
+        if (not in_components and ":" in line
+                and not line.lower().startswith(("corroboration scoring", "interpretation",
+                                                 "case id", "total score"))):
+            facts.append(line)
+    return components, facts
+
+
+def render_score_breakdown(engine_notes, case_id):
+    info = score_component_info()
+    for i, note in enumerate(engine_notes["note_text"]):
+        components, facts = parse_engine_note(note)
+        if not components:
+            st.code(note, language=None)
+            continue
+        table = pd.DataFrame([
+            {
+                "Component": info.get(key, (key, ""))[0],
+                "Points": points,
+                "Rule": info.get(key, (key, "Not described in this app version."))[1],
+            }
+            for key, points in components
+        ])
+        st.dataframe(
+            table, hide_index=True, width="stretch",
+            column_config={
+                "Points": st.column_config.NumberColumn("Points", format="%.0f"),
+                "Rule": st.column_config.TextColumn("How it is earned", width="large"),
+            },
+        )
+        if facts:
+            st.caption(" \u00b7 ".join(facts))
+        st.caption(
+            "This score ranks how many independent kinds of evidence overlap, not how large any "
+            "one anomaly is. A one-signal case with a huge ratio can rank below a modest case with "
+            "several signal types, linked entities and tight timing. Use Signal explorer to rank "
+            "by magnitude. It is a triage heuristic, not a fraud probability."
+        )
+        if st.checkbox("Show the engine's raw note", key=f"raw_note_{case_id}_{i}"):
+            st.code(note, language=None)
+
+
+def render_reading_guide(topic="all", expanded=False):
+    """Plain-language definitions of flags, scores and data limits, shown where they are needed."""
+    if topic in ("all", "flags"):
+        with st.expander("What the flags, categories and signal types mean", expanded=expanded):
+            st.markdown(
+                f"**verify (unit/type mismatch).** The two documents in the signal differ in unit "
+                f"number or property type, so they may describe different legal interests under one "
+                f"BBL, for example a condo unit and its parking or storage allocation. The row is "
+                f"kept rather than dropped. The app does not store which field differs, so open both "
+                f"documents. In the score it costs {abs(score_weights()['mismatch_penalty']):g} points per row.\n\n"
+                f"**category.** `candidate` rows are eligible to form cases and carry score. "
+                f"`recurring_pattern` (rapid flips only) means the same property flips two or more "
+                f"times, which usually reflects how a building records documents. `block_pattern` "
+                f"(over-mortgaging only) means three or more over-mortgaged lots on one block, "
+                f"usually one construction or blanket loan. Only `candidate` rows form cases, so the "
+                f"other two show a blank case id.\n\n"
+                f"**Over-mortgaging.** A mortgage recorded shortly after a deed for more than the deed "
+                f"amount. Ratios above {SANITY_CEILING_RATIO:.0f}x are usually structural: in the manual "
+                f"reviews so far, the ratios that high were a CEMA consolidation and a tax-exempt "
+                f"affordable-housing loan.\n\n"
+                f"**Rapid flip.** Two sales of the same property in a short window at a higher price. "
+                f"If both documents carry the same date their order is not reliable, so the direction "
+                f"of the price change may be reversed.\n\n"
+                f"**Nominal chain.** A deed recorded for a token or missing amount, followed by a "
+                f"resale (`nominal_then_resale`) or a mortgage (`nominal_then_mortgage`) involving "
+                f"a party with the same name. Nominal amounts are common, so many chains are ordinary: "
+                f"gifts, family or estate transfers, corrections. `continuity = name_match` means the "
+                f"same normalised name appears on both sides of the chain; `unknown` means a document "
+                f"had no readable party names. A shared name token between grantor and grantee is a "
+                f"family hint and is usually benign.\n\n"
+                f"**Connecting vs evidence-only entities.** An entity is *connecting* when it holds an "
+                f"ownership role on at least two of the case's own properties. Otherwise it is "
+                f"*evidence-only*: it appears on the case's documents but links nothing by itself."
+            )
+    if topic in ("all", "score"):
+        with st.expander("How the case score works", expanded=expanded):
+            st.markdown(
+                "The score is an **investigation-priority heuristic**, not a fraud probability. It "
+                "rewards how many independent kinds of evidence overlap in a case, **not** how large "
+                "any single anomaly is. To rank by size, use Signal explorer."
+            )
+            info = score_component_info()
+            st.dataframe(
+                pd.DataFrame(
+                    [{"Component": label, "How it is earned": rule} for label, rule in info.values()]
+                ),
+                hide_index=True, width="stretch",
+            )
+            st.markdown(
+                "There is no fixed maximum. Score bars in the queue are scaled to the 95th-percentile "
+                "score, so a few very large cases show a full bar instead of flattening the rest."
+            )
+    if topic in ("all", "limits"):
+        with st.expander("Known limits of the data and the flags", expanded=expanded):
+            st.markdown(
+                "- **Dates.** `days_between` for rapid flips and over-mortgaging comes from the "
+                "document date, which ACRIS fills unreliably for some mortgage document types. "
+                "Check the recorded date in ACRIS.\n"
+                "- **Amounts.** Deed amounts are as recorded, not verified sale consideration. "
+                "Nominal amounts are common.\n"
+                "- **Document types.** Signals are built from ordinary conveyance deeds only. "
+                "Timeshare deeds, corrective deeds, contracts, leases and easements are excluded "
+                "as of the latest pipeline run.\n"
+                "- **CEMA proxies.** A hint only. It is not part of any case score, so a case "
+                "driven by a probable CEMA is not downgraded, and `none` does not rule one out: "
+                "the proxy has missed at least one manually confirmed CEMA.\n"
+                "- **Entity matching.** Names are merged by fuzzy matching and are candidate "
+                "merges. False merges have been observed. Trustee-style names are matched on the "
+                "full string, so some same-person variants stay separate.\n"
+                "- **Case ids** change on every rebuild. Note findings by BBL."
+            )
+
+
+def _num(x):
+    try:
+        v = float(x)
+        return None if math.isnan(v) else v
+    except (TypeError, ValueError):
+        return None
+
+
+def _txt(x):
+    return "" if x is None or (isinstance(x, float) and math.isnan(x)) or pd.isna(x) else str(x)
+
+
+def _truthy(x):
+    return _txt(x).strip().lower() in {"true", "t", "1", "yes", "y"}
+
+
+def _mismatch_note(r):
+    return ". verify: unit or property type differs" if r.get("unit_or_type_mismatch") == True else ""  # noqa: E712
+
+
+def why_flip(r):
+    a, b, d = _num(r.get("sale1_amt")), _num(r.get("sale2_amt")), _num(r.get("days_between"))
+    parts = []
+    if a and b is not None and a > 0:
+        parts.append(f"Resold at {b / a:.1f}x the earlier amount")
+    elif b is not None:
+        parts.append("Resold after a nominal or missing earlier amount")
+    if d is not None:
+        parts.append(f"{int(d)} day(s) apart")
+    text = ", ".join(parts) or "Two sales in a short window"
+    if d == 0:
+        text += ". Same-day pair: order is unreliable, verify the direction"
+    return text + _mismatch_note(r)
+
+
+def why_over_mortgaging(r):
+    ratio, d = _num(r.get("mortgage_to_price_ratio")), _num(r.get("days_between"))
+    text = f"Mortgage is {ratio:.1f}x the deed amount" if ratio is not None else "Mortgage exceeds the deed amount"
+    if d is not None:
+        text += f", documents dated {int(d)} day(s) apart"
+    if ratio is not None and ratio > SANITY_CEILING_RATIO:
+        text += f". Above {SANITY_CEILING_RATIO:.0f}x: usually a CEMA, blanket or building loan"
+    return text + _mismatch_note(r)
+
+
+def why_nominal_chain(r):
+    kind, gap, amt2 = _txt(r.get("chain_type")), _num(r.get("gap_days")), _num(r.get("followon_amt"))
+    first = "Deed for a token or missing amount"
+    if kind == "nominal_then_resale":
+        text = f"{first}, then resold" + (f" for ${amt2:,.0f}" if amt2 else "")
+    elif kind == "nominal_then_mortgage":
+        text = f"{first}, then mortgaged" + (f" for ${amt2:,.0f}" if amt2 else "")
+    else:
+        text = f"{first}, then a follow-on record"
+    if gap is not None:
+        text += f", {int(gap)} day(s) later"
+    if _txt(r.get("continuity")) == "unknown":
+        text += ". Party names unreadable: continuity unconfirmed"
+    if _truthy(r.get("shared_name_token")):
+        text += ". Grantor and grantee share a name token (possible family transfer)"
+    return text
+
+
+@st.cache_data(ttl=30)
+def fetch_case_nominal_chains(case_id):
+    return run_query("""
+        SELECT snc.signal_id, snc.bbl, snc.chain_type, snc.continuity,
+               snc.shared_name_token, snc.partial_interest_pct,
+               snc.deeda_doc_id, d1.doc_type AS deeda_type, snc.deeda_date, snc.deeda_amt,
+               snc.followon_doc_id, d2.doc_type AS followon_type, snc.followon_date, snc.followon_amt,
+               snc.gap_days, snc.grantor_names, snc.grantee_names
+        FROM case_signals cs
+        JOIN signal_nominal_chains snc
+            ON snc.signal_id = cs.signal_id AND cs.signal_type = 'nominal_chain'
+        LEFT JOIN documents d1 ON d1.document_id = snc.deeda_doc_id
+        LEFT JOIN documents d2 ON d2.document_id = snc.followon_doc_id
+        WHERE cs.case_id = %(case_id)s
+        ORDER BY CASE WHEN LOWER(COALESCE(snc.shared_name_token, '')) IN ('true', 't', '1', 'yes', 'y')
+                      THEN 1 ELSE 0 END,
+                 snc.followon_amt DESC NULLS LAST, snc.bbl
+        LIMIT %(lim)s
+    """, {"case_id": case_id, "lim": NOMINAL_CASE_ROW_LIMIT})
+
+
+def render_case_nominal_chains(case_id, n_total):
+    """Nominal chains for one case, with the same 'why flagged' and review columns as the other signals.
+    Returns the rows shown so the review picker can offer them."""
+    if not table_exists("signal_nominal_chains"):
+        st.caption("Nominal-chain table not found in this database.")
+        return pd.DataFrame()
+    chains = fetch_case_nominal_chains(case_id)
+    if chains.empty:
+        st.caption("No nominal-chain signals in this case.")
+        return chains
+    st.subheader(f"Nominal chains ({n_total})")
+    chains = add_review_columns(chains, "nominal_chain", "deeda_doc_id", "followon_doc_id")
+    display = chains.assign(
+        why=chains.apply(why_nominal_chain, axis=1),
+        family_hint=chains["shared_name_token"].map(lambda v: "family hint" if _truthy(v) else ""),
+        deeda_doc=chains["deeda_doc_id"].map(acris_link),
+        followon_doc=chains["followon_doc_id"].map(acris_link),
+    )
+    st.dataframe(
+        display[["bbl", "why", "chain_type", "deeda_type", "deeda_date", "deeda_amt",
+                 "followon_type", "followon_date", "followon_amt", "gap_days",
+                 "continuity", "family_hint", "review", "reason",
+                 "deeda_doc", "followon_doc", "grantor_names", "grantee_names"]],
+        width="stretch", hide_index=True,
+        column_config={
+            "why": st.column_config.TextColumn("Why flagged", width="large"),
+            "deeda_doc": doc_link_column("Nominal deed doc"),
+            "followon_doc": doc_link_column("Follow-on doc"),
+        },
+    )
+    if n_total > len(chains):
+        st.caption(
+            f"Showing {len(chains)} of {n_total} chains, largest follow-on amount first and family-hint chains last. "
+            "Use the Transfer signals page to browse the rest."
+        )
+    st.caption(
+        "Dates are recorded dates. Nominal amounts are common, so check whether the nominal deed "
+        "is a family or estate transfer, a correction, or a real sale with the price recorded elsewhere."
+    )
+    return chains
+
+
+
 @st.cache_data(ttl=30)
 def fetch_case_list():
     return run_query("""
         SELECT c.case_id, c.title, c.status, c.score, c.summary,
                COUNT(DISTINCT cp.bbl) AS n_properties,
                COUNT(DISTINCT (cs.signal_type, cs.signal_id)) AS n_signals,
+               COUNT(DISTINCT (cs.signal_type, cs.signal_id))
+                   FILTER (WHERE cs.signal_type = 'nominal_chain') AS n_nominal,
                COUNT(DISTINCT ce.entity_id) AS n_entities
         FROM cases c
         LEFT JOIN case_properties cp ON cp.case_id = c.case_id
@@ -263,7 +609,8 @@ def fetch_case_properties(case_id):
 def fetch_case_entities(case_id):
     return run_query("""
         SELECT e.entity_id, e.canonical_name, e.entity_kind, e.resolution_status,
-               BOOL_OR(er.is_connecting) AS is_connecting
+               COUNT(DISTINCT er.bbl) FILTER (WHERE er.is_connecting) AS n_case_bbls,
+               (COUNT(DISTINCT er.bbl) FILTER (WHERE er.is_connecting) >= 2) AS is_connecting
         FROM case_entities ce
         JOIN entities e ON e.entity_id = ce.entity_id
         LEFT JOIN entity_relationships er
@@ -271,7 +618,7 @@ def fetch_case_entities(case_id):
            AND er.bbl IN (SELECT bbl FROM case_properties WHERE case_id = %(case_id)s)
         WHERE ce.case_id = %(case_id)s
         GROUP BY e.entity_id, e.canonical_name, e.entity_kind, e.resolution_status
-        ORDER BY is_connecting DESC NULLS LAST, e.canonical_name
+        ORDER BY n_case_bbls DESC, e.canonical_name
     """, {"case_id": case_id})
 
 
@@ -852,6 +1199,11 @@ def render_transfer_signals():
             "Mortgage records flagged as possible CEMA-related activity. "
             "These are proxies, not definitive identification of a CEMA transaction."
         )
+        st.caption(
+            "A proxy is a hint only and is not part of any case score. A case driven by a probable "
+            "CEMA is not downgraded, and a proxy of none does not rule one out: it has missed at "
+            "least one manually confirmed CEMA."
+        )
 
         c1, c2 = st.columns(2)
         with c1:
@@ -1018,6 +1370,8 @@ def render_signal_explorer():
         "recorded ACRIS amounts; they have not been independently verified as "
         "sale consideration. Open the document links before drawing conclusions."
     )
+    render_reading_guide("flags")
+    render_reading_guide("limits")
 
     signal_type = st.sidebar.radio(
         "Signal type",
@@ -1054,6 +1408,8 @@ def render_signal_explorer():
             f"Hide ratios above {SANITY_CEILING_RATIO:.0f}x (sanity-ceiling trips)",
             value=False,
             key="signal_explorer_hide_ceiling",
+            help="Ratios this high are usually a CEMA, blanket or building loan. In the manual "
+                 "reviews so far, the ratios above this line were both benign.",
         )
 
         max_days = st.sidebar.number_input(
@@ -2249,10 +2605,9 @@ def render_case_detail(case_id, cases_df):
     engine_notes = notes_df[notes_df["author"] == "corroboration_engine"]
     if not engine_notes.empty:
         with st.expander("Corroboration score breakdown", expanded=True):
-            for note in engine_notes["note_text"]:
-                st.code(note, language=None)
+            render_score_breakdown(engine_notes, case_id)
 
-            other_notes = notes_df[notes_df["author"] != "corroboration_engine"]
+    other_notes = notes_df[notes_df["author"] != "corroboration_engine"]
     if not other_notes.empty:
         with st.expander("Analyst notes"):
             for _, row in other_notes.iterrows():
@@ -2284,11 +2639,23 @@ def render_case_detail(case_id, cases_df):
             st.caption("No resolved entities linked to this case.")
         else:
             entities_df = entities_df.assign(
-                role=entities_df["is_connecting"].map({True: "connecting", False: "evidence-only"}).fillna("evidence-only")
+                role=entities_df["is_connecting"].map({True: "connecting", False: "evidence-only"}).fillna("evidence-only"),
+                case_properties_linked=entities_df["n_case_bbls"].fillna(0).astype(int),
             )
             st.dataframe(
-                entities_df[["canonical_name", "entity_kind", "resolution_status", "role"]],
+                entities_df[["canonical_name", "entity_kind", "resolution_status", "role",
+                             "case_properties_linked"]],
                 width="stretch", hide_index=True,
+                column_config={
+                    "case_properties_linked": st.column_config.NumberColumn(
+                        "Case properties linked",
+                        help="Number of this case's properties where the entity holds an ownership role.",
+                    ),
+                },
+            )
+            st.caption(
+                "Connecting = ownership role on at least two of this case's properties. "
+                "Evidence-only = appears on the case's documents but links nothing by itself."
             )
 
     with tab_signals:
@@ -2302,15 +2669,17 @@ def render_case_detail(case_id, cases_df):
                 mismatch=flips_df["unit_or_type_mismatch"].map({True: "verify", False: ""}),
                 sale1_doc=flips_df["sale1_document_id"].map(acris_link),
                 sale2_doc=flips_df["sale2_document_id"].map(acris_link),
+                why=flips_df.apply(why_flip, axis=1),
             )
             st.dataframe(
-                display[["bbl", "sale1_date", "sale1_amt", "sale2_date", "sale2_amt",
+                display[["bbl", "why", "sale1_date", "sale1_amt", "sale2_date", "sale2_amt",
                         "pct_price_increase", "days_between", "category", "mismatch",
                         "review", "reason", "sale1_doc", "sale2_doc"]],
                 width="stretch", hide_index=True,
                 column_config={
                     "sale1_doc": doc_link_column("Sale 1 doc"),
                     "sale2_doc": doc_link_column("Sale 2 doc"),
+                    "why": st.column_config.TextColumn("Why flagged", width="large"),
                 },
             )
         else:
@@ -2323,15 +2692,17 @@ def render_case_detail(case_id, cases_df):
                 mismatch=mtg_df["unit_or_type_mismatch"].map({True: "verify", False: ""}),
                 deed_doc=mtg_df["deed_document_id"].map(acris_link),
                 mtge_doc=mtg_df["mtge_document_id"].map(acris_link),
+                why=mtg_df.apply(why_over_mortgaging, axis=1),
             )
             st.dataframe(
-                display[["bbl", "deed_date", "deed_amt", "mtge_date", "mtge_amt",
+                display[["bbl", "why", "deed_date", "deed_amt", "mtge_date", "mtge_amt",
                         "mortgage_to_price_ratio", "days_between", "category", "mismatch",
                         "review", "reason", "deed_doc", "mtge_doc"]],
                 width="stretch", hide_index=True,
                 column_config={
                     "deed_doc": doc_link_column("Deed doc"),
                     "mtge_doc": doc_link_column("Mortgage doc"),
+                    "why": st.column_config.TextColumn("Why flagged", width="large"),
                 },
             )
             st.caption(
@@ -2341,6 +2712,9 @@ def render_case_detail(case_id, cases_df):
             )
         else:
             st.caption("No over-mortgaging signals in this case.")
+
+        nominal_df = render_case_nominal_chains(case_id, int(case_row.get("n_nominal", 0) or 0))
+        render_reading_guide("flags")
 
     with tab_timeline:
         events_df = fetch_case_events(case_id)
@@ -2390,6 +2764,11 @@ def render_case_detail(case_id, cases_df):
             "flip", r["bbl"], r["sale1_document_id"], r["sale2_document_id"],
             f"flip -- {r['bbl']} -- {r['pct_price_increase']:.2f}",
         ))
+    for _, r in nominal_df.iterrows():
+        options.append((
+            "nominal_chain", r["bbl"], r["deeda_doc_id"], r["followon_doc_id"],
+            f"nominal chain -- {r['bbl']} -- {r['chain_type']}",
+        ))
     if not options:
         st.caption("No signals in this case to review.")
     else:
@@ -2398,7 +2777,10 @@ def render_case_detail(case_id, cases_df):
             format_func=lambda i: options[i][4], key=f"review_pick_{case_id}",
         )
         stype, bbl, da, db, _label = options[idx]
-        render_review_form(stype, bbl, da, db, key=f"case_{case_id}_{idx}")
+        render_review_form(
+            stype, bbl, da, db, key=f"case_{case_id}_{idx}",
+            reasons=NOMINAL_CHAIN_REASONS if stype == "nominal_chain" else None,
+        )
 
 # ============================================================
 # CASE QUEUE
@@ -2410,6 +2792,7 @@ def render_case_queue():
         "Cases from case_builder.py, scored by corroboration_engine.py. Scores are "
         "explainable triage heuristics, not fraud probabilities."
     )
+    render_reading_guide("score")
 
     cases_df = fetch_case_list()
     if cases_df.empty:
@@ -2426,27 +2809,52 @@ def render_case_queue():
         value=float(cases_df["score"].min()),
     )
     min_properties = st.sidebar.number_input("Minimum properties", min_value=1, value=1, step=1)
+    hide_nominal_only = st.sidebar.checkbox(
+        "Hide cases made only of nominal chains", value=False,
+        help="Nominal chains are common and often benign (family transfers, deeds into an LLC "
+             "at refinancing). Tick this to see only cases with a flip or over-mortgaging signal.",
+    )
 
-    filtered = cases_df[
+    mask = (
         cases_df["status"].isin(status_filter)
         & (cases_df["score"] >= min_score)
         & (cases_df["n_properties"] >= min_properties)
-    ].reset_index(drop=True)
+    )
+    if hide_nominal_only:
+        mask &= (cases_df["n_signals"] - cases_df["n_nominal"]) > 0
+    filtered = cases_df[mask].reset_index(drop=True)
 
     st.write(f"{len(filtered)} of {len(cases_df)} cases match current filters")
 
-    display_cols = ["case_id", "score", "status", "n_properties", "n_signals", "n_entities", "title"]
+    score_max = float(cases_df["score"].max())
+    bar_max = float(cases_df["score"].quantile(0.95))
+    if not bar_max > 0:
+        bar_max = score_max if score_max > 0 else 1.0
+    n_clipped = int((cases_df["score"] > bar_max).sum())
+    if n_clipped:
+        st.caption(
+            f"Score bars are scaled to the 95th-percentile score ({bar_max:.0f}). "
+            f"{n_clipped} case(s) score higher and show a full bar; the number is still exact."
+        )
+
+    display_cols = ["case_id", "score", "status", "n_properties", "n_signals", "n_nominal",
+                    "n_entities", "title"]
     st.dataframe(
         filtered[display_cols], width="stretch", hide_index=True,
         column_config={
             "score": st.column_config.ProgressColumn(
                 "Score", help="Explainable triage heuristic, not a fraud probability.",
-                min_value=min(0.0, float(cases_df["score"].min())), max_value=float(cases_df["score"].max()),
+                min_value=min(0.0, float(cases_df["score"].min())), max_value=bar_max,
                 format="%.0f",
             ),
             "case_id": st.column_config.NumberColumn("Case", help="Changes on every rebuild; note findings by BBL."),
             "n_properties": st.column_config.NumberColumn("Properties"),
             "n_signals": st.column_config.NumberColumn("Signals"),
+            "n_nominal": st.column_config.NumberColumn(
+                "Nominal",
+                help="Nominal chains in the case: a token-amount deed followed by a resale or mortgage. "
+                     "Common and often benign; see the flag guide.",
+            ),
             "n_entities": st.column_config.NumberColumn("Entities"),
             "title": st.column_config.TextColumn("Summary", width="large"),
         },
@@ -2719,6 +3127,7 @@ def home_stats():
         "cases": scalar("SELECT COUNT(*) FROM cases"),
         "mtg": scalar("SELECT COUNT(*) FROM signal_over_mortgaging WHERE category = 'candidate'"),
         "flips": scalar("SELECT COUNT(*) FROM signal_flips WHERE category = 'candidate'"),
+        "nominal": scalar("SELECT COUNT(*) FROM signal_nominal_chains"),
         "refi": None, "geo_exact": None, "geo_block": None, "reviews": {}, "audit_reviewed": 0,
     }
     try:
@@ -2740,7 +3149,7 @@ def home_stats():
         pass
     try:
         rv = run_query("SELECT signal_type, status, COUNT(*) AS n FROM signal_reviews GROUP BY 1, 2")
-        cand = rv[rv["signal_type"].isin(["over_mortgaging", "flip", "serial_refinancing"])]
+        cand = rv[rv["signal_type"].isin(["over_mortgaging", "flip", "serial_refinancing", "nominal_chain"])]
         stats["reviews"] = cand.groupby("status")["n"].sum().astype(int).to_dict()
         stats["audit_reviewed"] = int(rv[rv["signal_type"] == "party_overlap_exclusion"]["n"].sum())
     except Exception:
@@ -2776,12 +3185,12 @@ def render_home():
     def fmt(n):
         return "\u2014" if n is None else f"{n:,}"
 
-    n_cand = sum(x for x in (stats["mtg"], stats["flips"], stats["refi"]) if x is not None)
+    n_cand = sum(x for x in (stats["mtg"], stats["flips"], stats["refi"], stats["nominal"]) if x is not None)
     reviewed = sum(stats["reviews"].values())
 
     tiles = st.columns(3)
     tiles[0].metric("Cases", fmt(stats["cases"]), help="Cases are grouped properties/signals for triage; they are not findings of wrongdoing.")
-    tiles[1].metric("Candidate signals", fmt(n_cand or None), help="Count of over-mortgaging, rapid-flip, and serial-refinancing rows in the latest signal outputs.")
+    tiles[1].metric("Candidate signals", fmt(n_cand or None), help="Count of over-mortgaging, rapid-flip, serial-refinancing, and nominal-chain rows in the latest signal outputs.")
     tiles[2].metric(
         "Reviewed",
         f"{reviewed:,}" if n_cand else "\u2014",
@@ -2860,6 +3269,16 @@ def render_home():
             "**Case ids change.** Cases are rebuilt from scratch on every pipeline run. "
             "Note findings by BBL, not by case number."
         )
+        st.markdown(
+            "**Scores rank corroboration, not size.** A case with several kinds of evidence "
+            "can outrank a single huge ratio. Use Signal explorer to sort by size."
+        )
+        st.markdown(
+            "**Nominal chains are common.** Many deeds record a token amount. A chain is a lead "
+            "only when the parties, timing and documents do not explain it."
+        )
+
+    render_reading_guide("all")
 
     key_counts = dict(stats["reviews"])
     key_counts["unreviewed"] = max(0, n_cand - reviewed)
